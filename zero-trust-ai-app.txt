@@ -1,0 +1,265 @@
+================================================================================
+ZERO-TRUST-AI-APP
+A Zero-Trust Authentication & Authorization Architecture for a Claude-like AI App
+================================================================================
+
+OVERVIEW
+--------
+This guide documents a three-act zero-trust security architecture, as actually
+implemented in this repository:
+
+  ACT 1 - AUTHENTICATION: Proving who the human is
+  ACT 2 - AUTHORIZATION:  Deciding what the human is allowed to do
+  ACT 3 - AGENT IDENTITY: Giving the AI agent its own scoped, cryptographic
+                          identity instead of letting it reuse the human's
+
+For the hands-on run/test commands, see README.md. This file is the "why".
+
+Stack:
+  - Keycloak 26.2            (Identity Provider / OIDC + OAuth2)
+  - PostgreSQL 16            (Keycloak persistence)
+  - FastAPI (Python 3.12)    (Backend API + all enforcement)
+  - SPIRE 1.15.2             (SPIFFE workload identity: server + agent)
+  - SPIRE OIDC Discovery Provider (exposes SPIRE's public keys as a JWKS)
+  - Docker Compose           (local orchestration)
+
+Why Keycloak 26.2 (not the 25.0 the first draft used):
+  Token exchange (RFC 8693) used to be a *preview* feature toggled with
+  `--features=token-exchange`. As of Keycloak 26.2 the "Standard Token Exchange"
+  is an officially supported, non-preview feature. We rely on the internal-to-
+  internal exchange to downscope Alice's token to a narrower agent token. No
+  fragile preview flag required - just `standard.token.exchange.enabled=true`
+  on the requesting client.
+
+Project layout:
+
+  zero-trust-ai-app/
+    docker-compose.yml
+    keycloak/realm-export.json
+    spire/
+      server/server.conf
+      agent/agent.conf
+      oidc-provider/oidc-discovery-provider.conf
+      oidc-provider/nginx.conf
+    backend/
+      Dockerfile
+      requirements.txt
+      auth.py
+      token_exchange.py
+      main.py
+    scripts/bootstrap-spire.sh
+
+
+================================================================================
+ACT 1 - AUTHENTICATION
+"Is this a real, logged-in human?"
+================================================================================
+
+Enforcer: Keycloak (identity) + FastAPI (token verification)
+
+Keycloak runs on a real Postgres database (data survives restarts) and auto-
+imports the `zerotrust` realm on boot from keycloak/realm-export.json. That
+realm ships:
+  - a public PKCE client `frontend` (browser apps can't keep secrets)
+  - a confidential client `backend-agent` (service account + token exchange)
+  - three realm roles: conversations:read, conversations:write, tools:invoke
+  - user alice / alice123
+
+PKCE (why the browser login is safe): the frontend generates a random
+code_verifier, hashes it (SHA-256) into a code_challenge, and sends the
+challenge with the login request. When exchanging the returned code for a
+token it must present the original verifier. This stops an intercepted auth
+code from being replayed by an attacker.
+
+THE DOCKER ISSUER GOTCHA (important, and handled in this repo):
+  A browser logs in against http://localhost:8081, so every token's `iss`
+  claim is "http://localhost:8081/realms/zerotrust". But the backend, running
+  inside the compose network, must reach Keycloak at http://keycloak:8080 to
+  fetch its public keys. If you naively point the backend at the internal URL
+  and also validate `iss` against it, verification fails.
+
+  Fix (see backend/auth.py + docker-compose.yml):
+    - KC_ISSUER      = http://localhost:8081/realms/zerotrust   (what we check `iss` against)
+    - KC_INTERNAL_URL= http://keycloak:8080                     (where we actually dial JWKS)
+    - Keycloak is started with KC_HOSTNAME=http://localhost:8081 (pins the issuer)
+      and KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true (lets internal callers reach it).
+
+What FastAPI verifies on every request (backend/auth.py verify_token):
+  - Signature check (against Keycloak's JWKS) -> Keycloak actually signed it
+  - issuer   == KC_ISSUER   -> rejects tokens from a different realm/IdP
+  - audience == "account"   -> rejects tokens meant for another service
+  - exp                     -> checked automatically by python-jose
+
+ACT 1 COMPLETE when: a real browser login produces a token, and FastAPI
+independently verifies it end to end, rejecting anything forged, expired, or
+mis-scoped. (curl commands: README, Act 1.)
+
+
+================================================================================
+ACT 2 - AUTHORIZATION
+"I know who you are - what are you allowed to do?"
+================================================================================
+
+Enforcer: FastAPI, using realm roles carried inside the verified token.
+
+Authentication proves identity. Authorization is a separate, independent
+question - a valid, genuine token does not imply the bearer can do anything.
+
+Roles map to a Claude-like app's actions:
+  conversations:read  -> viewing chat history
+  conversations:write -> sending messages / creating chats
+  tools:invoke        -> letting the assistant call tools/functions
+
+Alice is granted all three. (She needs tools:invoke so Act 3 can NARROW DOWN
+to it - a token exchange can only ever narrow a permission the user already
+holds; it cannot invent one.)
+
+Enforcement (backend/auth.py require_role + backend/main.py):
+  def require_role(required_role):
+      def role_checker(claims = Depends(verify_token)):
+          roles = claims.get("realm_access", {}).get("roles", [])
+          if required_role not in roles:
+              raise HTTPException(403, f"Missing required role: {required_role}")
+          return claims
+      return role_checker
+
+401 vs 403:
+  401 = "I don't know who you are."                    (authentication failure)
+  403 = "I know exactly who you are, and the answer is no." (authorization failure)
+
+ACT 2 COMPLETE when: each endpoint independently gates on its role. You'll see
+the 403 for real in Act 3, where the AGENT's narrow token is refused for any
+action outside its single scope.
+
+
+================================================================================
+ACT 3 - AGENT IDENTITY
+"The agent is not Alice. Give it its own, weaker identity."
+================================================================================
+
+Enforcer: SPIRE (workload identity) + Keycloak (RFC 8693 token exchange)
+
+If the AI agent runs around with Alice's full token, a hijacked or buggy agent
+could do anything Alice can. Zero-trust says: the agent gets its own,
+separately-scoped, cryptographically-issued identity - a valet key, not the
+master key.
+
+--------------------------------------------------------------------------------
+3.1 - SPIRE gives the container an identity (no secrets)
+--------------------------------------------------------------------------------
+SPIRE server issues identities; the SPIRE agent attests workloads on a node.
+Here the agent uses the DOCKER workload attestor: it inspects a container's
+Docker labels and, if they match a registered entry, mints that container a
+SPIFFE identity. Our backend registers as:
+
+  spiffe://zerotrust.local/backend-agent
+  matched by selector: docker:label:org.zerotrust.name:backend-agent
+
+No password, no static key - identity comes purely from what the container IS.
+
+First-boot join (scripts/bootstrap-spire.sh automates this):
+  1. server generates a one-time join token for spiffe://zerotrust.local/agent
+  2. the agent starts with that token and performs node attestation
+  3. we register the backend-agent workload entry (Docker label selector)
+
+The SPIRE OIDC Discovery Provider (+ an nginx unix-socket->HTTP shim) publishes
+SPIRE's public keys as a JWKS at http://spire-oidc-nginx:8443/keys, so Keycloak
+can verify SPIRE-signed JWT-SVIDs the same way it verifies its own tokens.
+
+--------------------------------------------------------------------------------
+3.2 - Keycloak downscopes via token exchange (RFC 8693)
+--------------------------------------------------------------------------------
+By default Keycloak dumps ALL of a user's realm roles into every token. To make
+the exchange genuinely NARROW things, the realm export configures:
+
+  - backend-agent: fullScopeAllowed=false
+      (the client no longer inherits all of the user's roles by default)
+  - backend-agent: standard.token.exchange.enabled=true
+  - a client scope "tools-invoke" (Optional) whose realm-role mapper emits ONLY
+      the tools:invoke role into realm_access.roles, plus an audience mapper so
+      the resulting token still carries aud=account (and thus passes Act 1
+      verification when the agent uses it).
+  - a scope mapping granting backend-agent the tools:invoke role.
+
+The exchange request (backend/token_exchange.py):
+
+  POST /realms/zerotrust/protocol/openid-connect/token
+    grant_type            = urn:ietf:params:oauth:grant-type:token-exchange
+    client_id             = backend-agent
+    client_secret         = ...          (AUTH_MODE=secret, default)
+    subject_token         = <Alice's access token>
+    subject_token_type    = urn:ietf:params:oauth:token-type:access_token
+    requested_token_type  = urn:ietf:params:oauth:token-type:access_token
+    scope                 = tools-invoke  (the optional scope that narrows roles)
+
+The returned token's realm_access.roles == ["tools:invoke"] ONLY. Proof it is
+enforced:
+  scoped token -> POST .../tools/invoke   => 200 (has tools:invoke)
+  scoped token -> POST .../messages       => 403 (Alice could; her agent cannot)
+
+--------------------------------------------------------------------------------
+3.3 - The last mile: no static secrets (optional upgrade)
+--------------------------------------------------------------------------------
+AUTH_MODE=secret still authenticates the exchange with a shared client_secret -
+exactly the kind of static credential SPIFFE exists to eliminate. The backend
+also implements AUTH_MODE=svid:
+
+  - it fetches a LIVE, short-lived JWT-SVID from the local SPIRE agent
+    (via the `spiffe` Python package, Workload API), and
+  - presents it as an RFC 7521 client assertion instead of a secret:
+      client_assertion_type = urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+      client_assertion      = <live JWT-SVID>
+
+For Keycloak to accept that, install the community SPI
+`spiffe-svid-client-authenticator` (mvn clean package -> mount the JAR into
+/opt/keycloak/providers/), and set the backend-agent client's authenticator to
+"SPIFFE SVID JWT" with:
+      Issuer   = spiffe://zerotrust.local
+      JWKS URL = http://spire-oidc-nginx:8443/keys
+Then delete the static secret and set AUTH_MODE=svid on the backend service.
+
+We ship `secret` as the default because that community plugin can lag newer
+Keycloak releases and needs building from source; `svid` is the documented,
+code-complete production upgrade.
+
+ACT 3 COMPLETE when: the /agent/invoke-tool call succeeds and returns a token
+scoped to ONLY tools:invoke - obtained by a container whose identity was
+auto-issued from its Docker label, with (in svid mode) ZERO static secrets
+anywhere in the chain. If the container is compromised, there is no reusable
+long-lived credential to steal.
+
+
+================================================================================
+END-TO-END SUMMARY
+================================================================================
+  Act 1: Keycloak (OIDC+PKCE) issues Alice a short-lived, signed JWT. FastAPI
+         independently verifies signature, issuer, audience, expiry.
+
+  Act 2: Realm roles enforced in FastAPI, independent of authentication.
+         401 = don't know you. 403 = know you, and no.
+
+  Act 3: The backend never reuses Alice's full token for tool invocation.
+         SPIRE gives the backend container its own cryptographic identity
+         (auto-issued from a Docker label, no secrets); that identity
+         authenticates an RFC 8693 token exchange with Keycloak, trading
+         Alice's token for one scoped to ONLY tools:invoke; that narrower
+         token is what actually calls the tool.
+
+  Net result: even a fully compromised agent can only ever hold a token that
+  (a) is scoped to the single capability it was exchanged for, (b) expires
+  quickly, and (c) required a live, per-container cryptographic identity to
+  obtain - never a long-lived secret.
+
+
+================================================================================
+KNOWN CAVEATS / PRODUCTION HARDENING NOT YET DONE
+================================================================================
+  - insecure_bootstrap = true on the SPIRE agent is dev-only; production uses a
+    real bootstrap trust bundle distributed out of band.
+  - No TLS between services in this local setup - production needs TLS throughout.
+  - The spiffe-svid-client-authenticator plugin is a community project - review
+    its code (and rebuild against Keycloak 26.2) before production use.
+  - SPIRE server uses SQLite - production uses a real database backend.
+  - Admin credentials, client secret, and DB password are demo values - replace
+    them and inject via secrets management for anything real.
+================================================================================

@@ -1,0 +1,204 @@
+services:
+  # ------------------------------------------------------------------ #
+  # ACT 1 - identity provider + its database                            #
+  # ------------------------------------------------------------------ #
+  keycloak-db:
+    image: postgres:16
+    container_name: keycloak-db
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+    volumes:
+      - keycloak-db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  keycloak:
+    # 26.2 ships Standard Token Exchange (RFC 8693) as an officially supported,
+    # non-preview feature. The realm export relies on
+    # `standard.token.exchange.enabled=true` on the backend-agent client, so the
+    # old 25.0 `--features=token-exchange` preview flag must NOT be used here.
+    image: quay.io/keycloak/keycloak:26.2
+    container_name: keycloak
+    # start-dev keeps hostname-strict off; we still pin KC_HOSTNAME so EVERY
+    # token's `iss` is the browser-facing URL, while KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+    # lets in-network services reach Keycloak at http://keycloak:8080.
+    command: start-dev --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      KC_HOSTNAME: http://localhost:8081
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+    depends_on:
+      - keycloak-db
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ #
+  # ACT 3 - SPIRE: workload identity                                    #
+  # ------------------------------------------------------------------ #
+  spire-server:
+    image: ghcr.io/spiffe/spire-server:1.15.2
+    container_name: spire-server
+    hostname: spire-server
+    # The GHCR SPIRE images run as non-root (UID 1000) and cannot write the
+    # root-owned named volumes. Running as root is fine for this local dev demo.
+    user: "0:0"
+    volumes:
+      - ./spire/server/server.conf:/opt/spire/conf/server/server.conf
+      - spire-server-data:/opt/spire/data/server
+    command: ["-config", "/opt/spire/conf/server/server.conf"]
+    restart: unless-stopped
+
+  spire-agent:
+    image: ghcr.io/spiffe/spire-agent:1.15.2
+    container_name: spire-agent
+    hostname: spire-agent
+    user: "0:0"                       # write root-owned volume + read docker.sock (dev only)
+    pid: "host"                       # docker workload attestor needs to see host PIDs
+    depends_on:
+      - spire-server
+    volumes:
+      - ./spire/agent/agent.conf:/opt/spire/conf/agent/agent.conf
+      - spire-agent-data:/opt/spire/data/agent
+      - spire-agent-socket:/opt/spire/sockets
+      - /var/run/docker.sock:/var/run/docker.sock
+    # First start needs a join token appended (see README, Act 3, Part B).
+    # After that, `docker start spire-agent` reuses the attested identity.
+    entrypoint: ["/opt/spire/bin/spire-agent", "run", "-config", "/opt/spire/conf/agent/agent.conf"]
+    restart: unless-stopped
+
+  spire-oidc-provider:
+    image: ghcr.io/spiffe/oidc-discovery-provider:1.15.2
+    container_name: spire-oidc-provider
+    hostname: spire-oidc-provider
+    user: "0:0"                       # bind socket in root-owned volume (dev only)
+    labels:
+      # The provider is itself a Workload API client: it must be a registered
+      # SPIRE workload to fetch the trust bundle it publishes as a JWKS.
+      # bootstrap-spire.sh registers this label as spiffe://.../oidc-provider.
+      - "org.zerotrust.name=spire-oidc-provider"
+    volumes:
+      - ./spire/oidc-provider/oidc-discovery-provider.conf:/opt/spire/conf/oidc-discovery-provider.conf
+      - spire-agent-socket:/opt/spire/sockets
+      - oidc-provider-socket:/run/oidc-discovery-provider
+    command: ["-config", "/opt/spire/conf/oidc-discovery-provider.conf"]
+    depends_on:
+      - spire-agent
+    restart: unless-stopped
+
+  spire-oidc-nginx:
+    image: nginx:1.27-alpine
+    container_name: spire-oidc-nginx
+    hostname: spire-oidc-nginx
+    volumes:
+      - ./spire/oidc-provider/nginx.conf:/etc/nginx/nginx.conf:ro
+      - oidc-provider-socket:/run/oidc-discovery-provider
+    ports:
+      - "8443:8443"
+    depends_on:
+      - spire-oidc-provider
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ #
+  # Acts 1-3 enforcement + Phases 4-6 app - the FastAPI backend         #
+  # (the "agent" workload SPIRE issues an identity to)                  #
+  # ------------------------------------------------------------------ #
+  backend-agent:
+    build: ./backend
+    container_name: backend-agent
+    hostname: backend-agent
+    labels:
+      # This label is what SPIRE's docker workload-attestor selector matches.
+      - "org.zerotrust.name=backend-agent"
+    environment:
+      KC_REALM: zerotrust
+      # Public issuer that appears in `iss` (matches the browser login URL).
+      KC_ISSUER: http://localhost:8081/realms/zerotrust
+      # Internal URL the backend actually dials for JWKS + token exchange.
+      KC_INTERNAL_URL: http://keycloak:8080
+      KC_AUDIENCE: account
+      # "secret" works out of the box; flip to "svid" after installing the
+      # SPIFFE Keycloak SPI (README, Act 3, Part D).
+      AUTH_MODE: secret
+      BACKEND_AGENT_SECRET: backend-agent-secret
+      SPIFFE_WORKLOAD_API: unix:///opt/spire/sockets/agent.sock
+      # Phase 4-6 app wiring (RLS data layer, LiteLLM gateway, mem0 memory).
+      APP_DB_URL: postgresql://appuser:apppassword@app-db:5432/appdb
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    volumes:
+      - spire-agent-socket:/opt/spire/sockets
+    ports:
+      - "8000:8000"
+    depends_on:
+      - keycloak
+      - spire-agent
+      - app-db
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ #
+  # Phase 4-6 - Data + model layer                                     #
+  #   app-db : Postgres + pgvector (app data, RLS-enforced; mem0 store) #
+  #   redis  : LiteLLM response cache                                   #
+  #   litellm: model gateway (holds provider keys; Claude -> GPT fallback) #
+  # ------------------------------------------------------------------ #
+  app-db:
+    image: pgvector/pgvector:pg16
+    container_name: app-db
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppassword
+    volumes:
+      - app-db-data:/var/lib/postgresql/data
+      - ./init-schema.sql:/docker-entrypoint-initdb.d/init-schema.sql:ro
+    ports:
+      - "5433:5432"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: litellm
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_DATABASE_URL: postgresql://appuser:apppassword@app-db:5432/appdb
+      LITELLM_LOG: DEBUG
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "4000:4000"
+    depends_on:
+      - app-db
+      - redis
+    restart: unless-stopped
+
+volumes:
+  keycloak-db-data:
+  spire-server-data:
+  spire-agent-data:
+  spire-agent-socket:
+  oidc-provider-socket:
+  app-db-data:
+  redis-data:
